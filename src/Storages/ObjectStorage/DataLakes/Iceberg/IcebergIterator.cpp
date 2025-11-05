@@ -122,10 +122,14 @@ std::optional<ManifestFileEntry> SingleThreadIcebergKeysIterator::next()
         return std::nullopt;
     }
 
+    interruption_checker.check();
+
     while (manifest_file_index < data_snapshot->manifest_list_entries.size())
     {
+        interruption_checker.check();
         if (!current_manifest_file_content)
         {
+            interruption_checker.check();
             if (persistent_components.format_version > 1 && data_snapshot->manifest_list_entries[manifest_file_index].content_type != manifest_file_content_type)
             {
                 ++manifest_file_index;
@@ -145,6 +149,7 @@ std::optional<ManifestFileEntry> SingleThreadIcebergKeysIterator::next()
         auto files = files_generator(current_manifest_file_content);
         while (internal_data_index < files.size())
         {
+            interruption_checker.check();
             const auto & manifest_file_entry = files[internal_data_index++];
             if ((manifest_file_entry.schema_id != previous_entry_schema) && (use_partition_pruning))
             {
@@ -237,6 +242,10 @@ SingleThreadIcebergKeysIterator::SingleThreadIcebergKeysIterator(
     , files_generator(files_generator_)
     , log(getLogger("IcebergIterator"))
     , manifest_file_content_type(manifest_file_content_type_)
+    , interruption_checker(
+          local_context_,
+          "Iceberg metadata read was cancelled",
+          "Query timed out during Iceberg metadata read")
 {
 }
 
@@ -283,6 +292,10 @@ IcebergIterator::IcebergIterator(
     , blocking_queue(100)
     , producer_task(std::nullopt)
     , callback(std::move(callback_))
+    , interruption_checker(
+          local_context_,
+          "Iceberg metadata read was cancelled",
+          "Query timed out during Iceberg metadata read")
 {
     auto delete_file = deletes_iterator.next();
     while (delete_file.has_value())
@@ -307,6 +320,7 @@ IcebergIterator::IcebergIterator(
                 std::optional<ManifestFileEntry> entry;
                 try
                 {
+                    interruption_checker.check();
                     entry = data_files_iterator.next();
                 }
                 catch (...)
@@ -321,13 +335,19 @@ IcebergIterator::IcebergIterator(
                 }
                 if (!entry.has_value())
                     break;
-                while (!blocking_queue.push(std::move(entry.value())))
+                auto manifest_entry = entry.value();
+                bool pushed = false;
+                while (!blocking_queue.isFinished() && !pushed)
                 {
+                    interruption_checker.check();
+                    pushed = blocking_queue.tryPush(manifest_entry, 100);
                     if (blocking_queue.isFinished())
                     {
                         break;
                     }
                 }
+                if (!pushed)
+                    break;
             }
             blocking_queue.finish();
         });
@@ -337,7 +357,21 @@ ObjectInfoPtr IcebergIterator::next(size_t)
 {
     ProfileEventTimeIncrement<Microseconds> watch(ProfileEvents::IcebergMetadataReadWaitTimeMicroseconds);
     Iceberg::ManifestFileEntry manifest_file_entry;
-    if (blocking_queue.pop(manifest_file_entry))
+    bool has_entry = false;
+    while (!has_entry)
+    {
+        interruption_checker.check();
+        if (blocking_queue.tryPop(manifest_file_entry, 100))
+        {
+            has_entry = true;
+            break;
+        }
+
+        if (blocking_queue.isFinishedAndEmpty())
+            break;
+    }
+
+    if (has_entry)
     {
         IcebergDataObjectInfoPtr object_info = std::make_shared<IcebergDataObjectInfo>(manifest_file_entry);
         for (const auto & position_delete : defineDeletesSpan(manifest_file_entry, position_deletes_files, false))
@@ -353,6 +387,8 @@ ObjectInfoPtr IcebergIterator::next(size_t)
         ProfileEvents::increment(ProfileEvents::IcebergMetadataReturnedObjectInfos);
         return object_info;
     }
+    interruption_checker.check();
+
     {
         std::lock_guard lock(exception_mutex);
         if (exception)
