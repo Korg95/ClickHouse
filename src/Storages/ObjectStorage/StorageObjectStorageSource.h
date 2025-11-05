@@ -10,6 +10,7 @@
 #include <Storages/ObjectStorage/IObjectIterator.h>
 #include <Formats/FormatParserSharedResources.h>
 #include <Formats/FormatFilterInfo.h>
+#include <Common/InterruptionChecker.h>
 namespace DB
 {
 
@@ -120,6 +121,8 @@ protected:
     ThreadPoolCallbackRunnerUnsafe<ReaderHolder> create_reader_scheduler;
     std::future<ReaderHolder> reader_future;
 
+    InterruptionChecker interruption_checker;
+
     /// Recreate ReadBuffer and Pipeline for each file.
     static ReaderHolder createReader(
         size_t processor,
@@ -142,6 +145,7 @@ protected:
 
     void addNumRowsToCache(const ObjectInfo & object_info, size_t num_rows);
     void lazyInitialize();
+    ReaderHolder waitForReaderFromFuture();
 };
 
 class StorageObjectStorageSource::ReadTaskIterator : public IObjectIterator, private WithContext

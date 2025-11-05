@@ -1,0 +1,28 @@
+name: Iceberg Integration Tests
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'tests/integration/test_iceberg/**'
+      - 'src/Storages/ObjectStorage/**'
+      - '.github/workflows/integration_tests.yml'
+
+jobs:
+  iceberg_cancellation_test:
+    name: Iceberg Cancellation Behavior
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build ClickHouse
+        run: ./ci/build_release.sh
+      - name: Run Iceberg Cancellation Integration Test
+        run: |
+          cd tests/integration
+          pytest test_iceberg/test_iceberg_cancellation.py -v --maxfail=1 --disable-warnings
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v3
+        with:
+          name: iceberg-cancellation-logs
+          path: tests/integration/output/*

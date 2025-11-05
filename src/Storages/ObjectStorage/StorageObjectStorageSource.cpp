@@ -1,6 +1,9 @@
 #include <memory>
 #include <optional>
 #include <Core/Settings.h>
+#include <chrono>
+#include <future>
+#include <utility>
 #include <Disks/IO/AsynchronousBoundedReadBuffer.h>
 #include <Disks/IO/CachedOnDiskReadBufferFromFile.h>
 #include <Disks/ObjectStorages/IObjectStorage.h>
@@ -25,6 +28,9 @@
 #include <Storages/Cache/SchemaCache.h>
 #include <Storages/HivePartitioningUtils.h>
 #include <Storages/ObjectStorage/DataLakes/DataLakeConfiguration.h>
+#if USE_AVRO
+#include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergMetadata.h>
+#endif
 #include <Storages/ObjectStorage/StorageObjectStorage.h>
 #include <Storages/ObjectStorage/StorageObjectStorageSource.h>
 #include <Storages/ObjectStorage/Utils.h>
@@ -55,6 +61,28 @@ namespace CurrentMetrics
 
 namespace DB
 {
+namespace
+{
+std::pair<String, String> getInterruptionMessages(const StorageObjectStorageConfigurationPtr & configuration)
+{
+#if USE_AVRO
+    if (configuration && configuration->isDataLakeConfiguration())
+    {
+        if (auto * metadata = dynamic_cast<IcebergMetadata *>(configuration->getExternalMetadata()))
+        {
+            (void)metadata;
+            return {
+                "Iceberg metadata read was cancelled",
+                "Query timed out during Iceberg metadata read"};
+        }
+    }
+#endif
+    return {
+        "Object storage read was cancelled",
+        "Query timed out during object storage read"};
+}
+}
+
 namespace Setting
 {
     extern const SettingsUInt64 max_download_buffer_size;
@@ -109,7 +137,10 @@ StorageObjectStorageSource::StorageObjectStorageSource(
     , file_iterator(file_iterator_)
     , schema_cache(StorageObjectStorage::getSchemaCache(context_, configuration->getTypeName()))
     , create_reader_scheduler(threadPoolCallbackRunnerUnsafe<ReaderHolder>(*create_reader_pool, "Reader"))
+    , interruption_checker()
 {
+    auto interruption_messages = getInterruptionMessages(configuration);
+    interruption_checker.reset(read_context, interruption_messages.first, interruption_messages.second);
 }
 
 StorageObjectStorageSource::~StorageObjectStorageSource()
@@ -273,6 +304,8 @@ Chunk StorageObjectStorageSource::generate()
 
     while (true)
     {
+        interruption_checker.check();
+
         if (isCancelled() || !reader)
         {
             if (reader)
@@ -395,8 +428,7 @@ Chunk StorageObjectStorageSource::generate()
 
         total_rows_in_file = 0;
 
-        assert(reader_future.valid());
-        reader = reader_future.get();
+        reader = waitForReaderFromFuture();
 
         if (!reader)
             break;
@@ -456,19 +488,25 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
     ObjectInfoPtr object_info;
     auto query_settings = configuration->getQuerySettings(context_);
 
+    auto interruption_messages = getInterruptionMessages(configuration);
+    InterruptionChecker local_checker(context_, interruption_messages.first, interruption_messages.second);
+
     do
     {
+        local_checker.check();
         object_info = file_iterator->next(processor);
 
         if (!object_info || object_info->getPath().empty())
             return {};
 
+        local_checker.check();
         if (!object_info->getObjectMetadata())
         {
             const auto & path = object_info->isArchive() ? object_info->getPathToArchive() : object_info->getPath();
 
             if (query_settings.ignore_non_existent_file)
             {
+                local_checker.check();
                 auto metadata = object_storage->tryGetObjectMetadata(path);
                 if (!metadata)
                     return {};
@@ -476,7 +514,10 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
                 object_info->setObjectMetadata(metadata.value());
             }
             else
+            {
+                local_checker.check();
                 object_info->setObjectMetadata(object_storage->getObjectMetadata(path));
+            }
         }
     } while (query_settings.skip_empty_files && object_info->getObjectMetadata()->size_bytes == 0);
 
@@ -643,6 +684,27 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
 std::future<StorageObjectStorageSource::ReaderHolder> StorageObjectStorageSource::createReaderAsync()
 {
     return create_reader_scheduler([=, this] { return createReader(); }, Priority{});
+}
+
+StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::waitForReaderFromFuture()
+{
+    if (!reader_future.valid())
+        return {};
+
+    while (true)
+    {
+        interruption_checker.check();
+
+        if (isCancelled())
+        {
+            reader_future.wait();
+            return {};
+        }
+
+        auto status = reader_future.wait_for(std::chrono::milliseconds(100));
+        if (status == std::future_status::ready)
+            return reader_future.get();
+    }
 }
 
 std::unique_ptr<ReadBufferFromFileBase> createReadBuffer(

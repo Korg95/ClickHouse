@@ -16,6 +16,7 @@
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Snapshot.h>
 
 #include <Common/ConcurrentBoundedQueue.h>
+#include <Common/InterruptionChecker.h>
 
 #include <optional>
 #include <base/defines.h>
@@ -76,6 +77,8 @@ private:
 
     size_t min_max_index_pruned_files = 0;
     size_t partition_pruned_files = 0;
+
+    InterruptionChecker interruption_checker;
 };
 
 }
@@ -112,6 +115,8 @@ private:
     std::vector<Iceberg::ManifestFileEntry> equality_deletes_files;
     std::exception_ptr exception;
     std::mutex exception_mutex;
+
+    InterruptionChecker interruption_checker;
 };
 }
 
